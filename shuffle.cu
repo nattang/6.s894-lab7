@@ -25,6 +25,29 @@ __global__ void no_shuffle_kernel(data_type *src, clock_type *dst) {
 
     // Your code goes here
 
+    mem[threadIdx.x] = val; // write val into shmem
+
+    if (threadIdx.x >= 1) {
+        mem[threadIdx.x] += mem[threadIdx.x - 1];
+    }
+    __syncthreads();
+    if (threadIdx.x >= 2) {
+        mem[threadIdx.x] += mem[threadIdx.x - 2];
+    }
+    __syncthreads();
+    if (threadIdx.x >= 4) {
+        mem[threadIdx.x] += mem[threadIdx.x - 4];
+    }
+    __syncthreads();
+    if (threadIdx.x >= 8) {
+        mem[threadIdx.x] += mem[threadIdx.x - 8];
+    }
+    __syncthreads();
+    if (threadIdx.x >= 16) {
+        mem[threadIdx.x] += mem[threadIdx.x - 16];
+    }
+    __syncthreads();
+
     end_time = clock_cycle();
     __threadfence();
 
@@ -43,6 +66,11 @@ __global__ void shuffle_kernel(data_type *src, clock_type *dst) {
     start_time = clock_cycle();
 
     // Your code goes here
+    for (int offset = 1; offset < 32; offset <<= 1) {
+        int n = __shfl_up_sync(0xffffffff, val, offset);
+        if (threadIdx.x >= offset)
+            val += n;
+    }
 
     end_time = clock_cycle();
     __threadfence();
@@ -127,10 +155,14 @@ template <typename F> void launch(F f, std::string name) {
 }
 int main() {
     launch(
-        [](data_type *src, clock_type *dst) { no_shuffle_kernel<<<1, warp_size>>>(src, dst); },
+        [](data_type *src, clock_type *dst) {
+            no_shuffle_kernel<<<1, warp_size>>>(src, dst);
+        },
         "shared memory cumsum");
     launch(
-        [](data_type *src, clock_type *dst) { shuffle_kernel<<<1, warp_size>>>(src, dst); },
+        [](data_type *src, clock_type *dst) {
+            shuffle_kernel<<<1, warp_size>>>(src, dst);
+        },
         "warpshuffle cumusm");
     return 0;
 }
