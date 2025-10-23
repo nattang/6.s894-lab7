@@ -27,26 +27,11 @@ __global__ void no_shuffle_kernel(data_type *src, clock_type *dst) {
 
     mem[threadIdx.x] = val; // write val into shmem
 
-    if (threadIdx.x >= 1) {
-        mem[threadIdx.x] += mem[threadIdx.x - 1];
+    for (int i = 1; i <= 16; i = i * 2) {
+        if (threadIdx.x & i) {
+            mem[threadIdx.x] = mem[threadIdx.x] + mem[threadIdx.x - threadIdx.x % i - 1];
+        }
     }
-    __syncthreads();
-    if (threadIdx.x >= 2) {
-        mem[threadIdx.x] += mem[threadIdx.x - 2];
-    }
-    __syncthreads();
-    if (threadIdx.x >= 4) {
-        mem[threadIdx.x] += mem[threadIdx.x - 4];
-    }
-    __syncthreads();
-    if (threadIdx.x >= 8) {
-        mem[threadIdx.x] += mem[threadIdx.x - 8];
-    }
-    __syncthreads();
-    if (threadIdx.x >= 16) {
-        mem[threadIdx.x] += mem[threadIdx.x - 16];
-    }
-    __syncthreads();
 
     end_time = clock_cycle();
     __threadfence();

@@ -22,6 +22,10 @@ void cuda_check(cudaError_t code, const char *file, int line) {
         cuda_check((x), __FILE__, __LINE__); \
     } while (0)
 
+#define CEIL_DIV(x, y) (((x) + (y) - 1) / (y))
+#define MAX(x, y) ((x) > (y) ? (x) : (y))
+#define MIN(x, y) ((x) < (y) ? (x) : (y))
+
 template <typename Op>
 void print_array(
     size_t n,
@@ -46,15 +50,186 @@ void scan_cpu(size_t n, typename Op::Data const *x, typename Op::Data *out) {
 ////////////////////////////////////////////////////////////////////////////////
 // Optimized GPU Implementation
 
+#define VALS_PER_THREAD 4
+#define WARPS_PER_BLOCK 32
+
+#define SPINE_VALS_PER_THREAD 16
+
 namespace scan_gpu {
 
-/* TODO: your GPU kernels here... */
+// Reduce each block & store into workspace[blockIdx.x]
+template <typename Op>
+__global__ void upstream_scan(
+    size_t n,
+    typename Op::Data *x,        // pointer to GPU memory
+    typename Op::Data *workspace // pointer to GPU memory
+) {
+    using Data = typename Op::Data;
+
+    extern __shared__ __align__(16) char shmem_raw[]; // OK
+    Data *shmem = reinterpret_cast<Data *>(shmem_raw);
+
+    int warpId = threadIdx.x / 32;
+    int laneId = threadIdx.x % 32;
+
+    int threads_per_block = blockDim.x;
+    int block_offset = blockIdx.x * threads_per_block * VALS_PER_THREAD;
+
+    int threadId = threadIdx.x;
+
+    Data vals[VALS_PER_THREAD];
+#pragma unroll
+    for (int i = 0; i < VALS_PER_THREAD; i++) {
+        int idx = block_offset + threadId * VALS_PER_THREAD + i;
+        vals[i] = x[idx];
+    }
+
+#pragma unroll
+    for (int i = 1; i < VALS_PER_THREAD; i++) {
+        vals[i] = Op::combine(vals[i - 1], vals[i]);
+    }
+
+    Data thread_sum = vals[VALS_PER_THREAD - 1];
+    shmem[threadId] = thread_sum;
+
+    // scan across shmem
+    for (int i = 1; i <= WARPS_PER_BLOCK * 32; i = i * 2) {
+        __syncthreads();
+        if (threadId >= i) {
+            shmem[threadId] = Op::combine(shmem[threadId - i], shmem[threadId]);
+        }
+    }
+    __syncthreads();
+
+    // mask first warp
+    Data threadPrefix = Op::identity();
+    if (threadId > 0) {
+        threadPrefix = shmem[threadId - 1];
+    }
+
+#pragma unroll
+    for (int i = 0; i < VALS_PER_THREAD; i++) {
+        vals[i] = Op::combine(threadPrefix, vals[i]);
+    }
+
+#pragma unroll
+    for (int i = 0; i < VALS_PER_THREAD; i++) {
+        int idx = block_offset + threadId * VALS_PER_THREAD + i;
+        x[idx] = vals[i];
+    }
+    __syncthreads();
+
+    // write blockSum to workspace
+    if (threadId == threads_per_block - 1) {        
+        workspace[blockIdx.x] = shmem[threads_per_block - 1];
+        // scan
+    }
+}
+
+template <typename Op>
+__global__ void spine_scan(
+    // size_t vals_per_thread,
+    typename Op::Data *blocksums // pointer to GPU memory
+) {
+    using Data = typename Op::Data;
+
+    extern __shared__ __align__(16) char shmem_raw[]; // OK
+    Data *shmem = reinterpret_cast<Data *>(shmem_raw);
+
+    int warpId = threadIdx.x / 32;
+    int laneId = threadIdx.x % 32;
+    int threads_per_block = blockDim.x;
+    int block_offset = blockIdx.x * threads_per_block * SPINE_VALS_PER_THREAD;
+    int threadId = threadIdx.x;
+
+    Data vals[SPINE_VALS_PER_THREAD];
+#pragma unroll
+    for (int i = 0; i < SPINE_VALS_PER_THREAD; i++) {
+        int idx = block_offset + threadId * SPINE_VALS_PER_THREAD + i;
+        vals[i] = blocksums[idx];
+    }
+#pragma unroll
+    for (int i = 1; i < SPINE_VALS_PER_THREAD; i++) {
+        vals[i] = Op::combine(vals[i - 1], vals[i]);
+    }
+
+    Data thread_sum = vals[SPINE_VALS_PER_THREAD - 1];
+    shmem[threadId] = thread_sum;
+
+    // scan across shmem
+    for (int i = 1; i <= WARPS_PER_BLOCK * 32; i = i * 2) {
+        __syncthreads();
+        if (threadId >= i) {
+            shmem[threadId] = Op::combine(shmem[threadId - i], shmem[threadId]);
+        }
+    }
+    __syncthreads();
+
+    // mask first warp
+    Data threadPrefix = Op::identity();
+    if (threadId > 0) {
+        threadPrefix = shmem[threadId - 1];
+    }
+
+#pragma unroll
+    for (int i = 0; i < SPINE_VALS_PER_THREAD; i++) {
+        vals[i] = Op::combine(threadPrefix, vals[i]);
+    }
+#pragma unroll
+    for (int i = 0; i < SPINE_VALS_PER_THREAD; i++) {
+        int idx = block_offset + threadId * SPINE_VALS_PER_THREAD + i;
+        blocksums[idx] = vals[i];
+    }
+    __syncthreads();
+}
+
+template <typename Op>
+__global__ void downstream_scan_fix(
+    typename Op::Data *x,        // pointer to GPU memory
+    typename Op::Data *blocksums // pointer to GPU memory
+) {
+    using Data = typename Op::Data;
+    int warpId = threadIdx.x / 32;
+    int laneId = threadIdx.x % 32;
+
+    int threads_per_block = blockDim.x;
+    int block_offset = blockIdx.x * threads_per_block * VALS_PER_THREAD;
+
+    int threadId = threadIdx.x;
+
+    Data vals[VALS_PER_THREAD];
+#pragma unroll
+    for (int i = 0; i < VALS_PER_THREAD; i++) {
+        int idx = block_offset + threadId * VALS_PER_THREAD + i;
+        vals[i] = x[idx];
+    }
+
+    Data block_prefix = Op::identity();
+    if (blockIdx.x > 0) {
+        block_prefix = blocksums[blockIdx.x - 1];
+    }
+
+#pragma unroll
+    for (int i = 0; i < VALS_PER_THREAD; i++) {
+        // int idx = block_offset + threadId * VALS_PER_THREAD + i;
+        vals[i] = Op::combine(block_prefix, vals[i]);
+    }
+
+#pragma unroll
+    for (int i = 0; i < VALS_PER_THREAD; i++) {
+        int idx = block_offset + threadId * VALS_PER_THREAD + i;
+        x[idx] = vals[i];
+    }
+    __syncthreads();
+}
 
 // Returns desired size of scratch buffer in bytes.
 template <typename Op> size_t get_workspace_size(size_t n) {
     using Data = typename Op::Data;
-    /* TODO: your CPU code here... */
-    return 0;
+
+    int num_blocks = CEIL_DIV(n, WARPS_PER_BLOCK * 32);
+    // return num_blocks * sizeof(Data) * 2; // double buffer
+    return n * sizeof(Data); // overallocate for simplicity
 }
 
 // 'launch_scan'
@@ -99,8 +274,46 @@ typename Op::Data *launch_scan(
     void *workspace       // pointer to GPU memory
 ) {
     using Data = typename Op::Data;
-    /* TODO: your CPU code here... */
-    return nullptr; // replace with an appropriate pointer
+    int num_blocks =
+        CEIL_DIV(n, VALS_PER_THREAD * WARPS_PER_BLOCK * 32); // 32 threads per warp
+    printf("Launching scan with %d blocks\n", num_blocks);
+
+    dim3 gridDim = dim3(num_blocks, 1, 1);
+    dim3 blockDim = dim3(WARPS_PER_BLOCK * 32, 1, 1);
+    uint32_t shmem_size_bytes = WARPS_PER_BLOCK * 32 * sizeof(Data);
+
+    CUDA_CHECK(cudaFuncSetAttribute(
+        upstream_scan<Op>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        shmem_size_bytes));
+
+    Data *block_sums = reinterpret_cast<Data *>(workspace);
+    Data *block_sums_workspace =
+        block_sums + num_blocks; // pointer arithmetic works on Data*
+
+    upstream_scan<Op><<<gridDim, blockDim, shmem_size_bytes>>>(n, x, block_sums);
+
+    if (num_blocks == 1) {
+        return x;
+    }
+
+    // block sum scan
+    int vals_per_thread = num_blocks / (WARPS_PER_BLOCK * 32);
+    // int num_spine_blocks = CEIL_DIV(num_blocks, vals_per_thread * WARPS_PER_BLOCK *
+    // 32);
+    int items_per_block = WARPS_PER_BLOCK * 32 * SPINE_VALS_PER_THREAD;
+    int num_spine_blocks = CEIL_DIV(num_blocks, items_per_block);
+
+    dim3 spine_gridDim(num_spine_blocks);
+    dim3 spine_blockDim(WARPS_PER_BLOCK * 32);
+    uint32_t spine_shmem_size_bytes = WARPS_PER_BLOCK * 32 * sizeof(Data);
+
+    spine_scan<Op><<<spine_gridDim, spine_blockDim, spine_shmem_size_bytes>>>(block_sums);
+
+    // downstream fixup
+    downstream_scan_fix<Op><<<gridDim, blockDim>>>(x, block_sums);
+
+    return x; // returning block_sums for testing purposes
 }
 
 } // namespace scan_gpu
@@ -211,8 +424,9 @@ template <typename Op> void print_array(size_t n, typename Op::Data const *x) {
     printf("]\n");
 
     if (total_print_array_output >= max_print_array_output) {
-        printf("(Reached maximum limit on 'print_array' output; skipping further calls "
-               "to 'print_array')\n");
+        printf(
+            "(Reached maximum limit on 'print_array' output; skipping further calls "
+            "to 'print_array')\n");
     }
 
     total_print_array_output++;
