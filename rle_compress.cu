@@ -56,7 +56,166 @@ void rle_compress_cpu(
 
 namespace rle_gpu {
 
-/* TODO: your GPU kernels here... */
+// Reduce each block & store into workspace[blockIdx.x]
+template <typename Op>
+__global__ void upstream_scan(
+    size_t n,
+    typename Op::Data *x,        // pointer to GPU memory
+    typename Op::Data *workspace // pointer to GPU memory
+) {
+    using Data = typename Op::Data;
+
+    extern __shared__ __align__(16) char shmem_raw[]; // OK
+    Data *shmem = reinterpret_cast<Data *>(shmem_raw);
+
+    int threadId = threadIdx.x;
+    int threads_per_block = blockDim.x;
+    int block_offset = blockIdx.x * threads_per_block * VALS_PER_THREAD;
+
+    // load from global memory & perform thread scan
+    Data vals[VALS_PER_THREAD];
+    for (int i = 0; i < VALS_PER_THREAD; i++) {
+        int idx = block_offset + threadId * VALS_PER_THREAD + i;
+        if (idx >= n) {
+            vals[i] = Op::identity();
+        } else {
+            vals[i] = x[idx];
+        }
+    }
+    for (int i = 1; i < VALS_PER_THREAD; i++) {
+        vals[i] = Op::combine(vals[i - 1], vals[i]);
+    }
+
+    Data thread_sum = vals[VALS_PER_THREAD - 1];
+    shmem[threadId] = thread_sum;
+
+    // scan across shmem (across all warps in the block)
+    for (int i = 1; i < threads_per_block; i <<= 1) {
+        __syncthreads();
+        Data cur_val = shmem[threadId];
+        if (threadId >= i) {
+            cur_val = Op::combine(shmem[threadId - i], cur_val);
+        }
+        __syncthreads();
+        shmem[threadId] = cur_val;
+    }
+    __syncthreads();
+
+    // add prev warp reduction to each thread
+    Data threadPrefix = Op::identity();
+    if (threadId > 0) { // mask first warp
+        threadPrefix = shmem[threadId - 1];
+    }
+    for (int i = 0; i < VALS_PER_THREAD; i++) {
+        vals[i] = Op::combine(threadPrefix, vals[i]);
+    }
+
+    // write back to x
+    for (int i = 0; i < VALS_PER_THREAD; i++) {
+        int idx = block_offset + threadId * VALS_PER_THREAD + i;
+        if (idx >= n) {
+            break;
+        }
+        x[idx] = vals[i];
+    }
+    // write blockSum to workspace
+    if (threadId == threads_per_block - 1) {
+        workspace[blockIdx.x] = shmem[threads_per_block - 1];
+    }
+}
+
+template <typename Op>
+__global__ void spine_scan(
+    // size_t vals_per_thread,
+    typename Op::Data *blocksums // pointer to GPU memory
+) {
+    using Data = typename Op::Data;
+
+    extern __shared__ __align__(16) char shmem_raw[]; // OK
+    Data *shmem = reinterpret_cast<Data *>(shmem_raw);
+
+    int threads_per_block = blockDim.x;
+    int threadId = threadIdx.x;
+
+    Data vals[SPINE_VALS_PER_THREAD];
+    for (int i = 0; i < SPINE_VALS_PER_THREAD; i++) {
+        int idx = threadId * SPINE_VALS_PER_THREAD + i;
+        vals[i] = blocksums[idx];
+    }
+
+    for (int i = 1; i < SPINE_VALS_PER_THREAD; i++) {
+        vals[i] = Op::combine(vals[i - 1], vals[i]);
+    }
+
+    Data thread_sum = vals[SPINE_VALS_PER_THREAD - 1];
+    shmem[threadId] = thread_sum;
+
+    // scan across shmem
+    for (int i = 1; i < threads_per_block; i <<= 1) {
+        __syncthreads();
+        Data cur_val = shmem[threadId];
+        if (threadId >= i) {
+            cur_val = Op::combine(shmem[threadId - i], cur_val);
+        }
+        __syncthreads();
+        shmem[threadId] = cur_val;
+    }
+    __syncthreads();
+
+    Data threadPrefix = Op::identity();
+    if (threadId > 0) {
+        threadPrefix = shmem[threadId - 1];
+    }
+
+    for (int i = 0; i < SPINE_VALS_PER_THREAD; i++) {
+        vals[i] = Op::combine(threadPrefix, vals[i]);
+    }
+
+    for (int i = 0; i < SPINE_VALS_PER_THREAD; i++) {
+        int idx = threadId * SPINE_VALS_PER_THREAD + i;
+        blocksums[idx] = vals[i];
+    }
+}
+
+template <typename Op>
+__global__ void downstream_scan_fix(
+    typename Op::Data *x,        // pointer to GPU memory
+    typename Op::Data *blocksums // pointer to GPU memory
+) {
+    using Data = typename Op::Data;
+
+    int threads_per_block = blockDim.x;
+    int block_offset = blockIdx.x * threads_per_block * VALS_PER_THREAD;
+
+    int threadId = threadIdx.x;
+
+    Data vals[VALS_PER_THREAD];
+    for (int i = 0; i < VALS_PER_THREAD; i++) {
+        int idx = block_offset + threadId * VALS_PER_THREAD + i;
+        vals[i] = x[idx];
+    }
+
+    Data block_prefix = Op::identity();
+    if (blockIdx.x > 0) {
+        block_prefix = blocksums[blockIdx.x - 1];
+    }
+
+    for (int i = 0; i < VALS_PER_THREAD; i++) {
+        int idx = block_offset + threadId * VALS_PER_THREAD + i;
+        vals[i] = Op::combine(block_prefix, vals[i]);
+    }
+
+    for (int i = 0; i < VALS_PER_THREAD; i++) {
+        int idx = block_offset + threadId * VALS_PER_THREAD + i;
+        x[idx] = vals[i];
+    }
+}
+
+// Returns desired size of scratch buffer in bytes.
+template <typename Op> size_t get_workspace_size(size_t n) {
+    int num_blocks = CEIL_DIV(n, WARPS_PER_BLOCK * 32);
+    return num_blocks * sizeof(uint32_t) * 2; // double buffer
+}
 
 // Returns desired size of scratch buffer in bytes.
 size_t get_workspace_size(uint32_t raw_count) {
@@ -94,7 +253,35 @@ uint32_t launch_rle_compress(
     char *compressed_data,       // pointer to GPU buffer
     uint32_t *compressed_lengths // pointer to GPU buffer
 ) {
-    /* TODO: your CPU code here... */
+    using Data = typename Op::Data;
+    int num_blocks =
+        CEIL_DIV(n, VALS_PER_THREAD * WARPS_PER_BLOCK * 32); // 32 threads per warp
+    // printf("Launching scan with %d blocks\n", num_blocks);
+
+    Data *block_sums = reinterpret_cast<Data *>(workspace);
+    Data *block_sums_workspace = block_sums + num_blocks;
+
+    // scan each block, store block sums in workspace
+    dim3 gridDim = dim3(num_blocks, 1, 1);
+    dim3 blockDim = dim3(WARPS_PER_BLOCK * 32, 1, 1);
+    uint32_t shmem_size_bytes = WARPS_PER_BLOCK * 32 * sizeof(Data);
+
+    // printf("lauchining upstream \n");
+    upstream_scan<Op><<<gridDim, blockDim, shmem_size_bytes>>>(n, raw, block_sums);
+
+    if (num_blocks == 1) {
+        return x;
+    }
+
+    // scan "spine" (the block sums)
+    dim3 spine_gridDim(1);
+    dim3 spine_blockDim(WARPS_PER_BLOCK * 32);
+    uint32_t spine_shmem_size_bytes = WARPS_PER_BLOCK * 32 * sizeof(Data);
+    spine_scan<Op><<<spine_gridDim, spine_blockDim, spine_shmem_size_bytes>>>(block_sums);
+
+    // downstream fixup
+    downstream_scan_fix<Op><<<gridDim, blockDim>>>(raw, block_sums);
+
     uint32_t compressed_count = 0;
     return compressed_count;
 }
