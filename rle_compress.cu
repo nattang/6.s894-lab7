@@ -81,15 +81,6 @@ __global__ void label_runs(
         }
     }
 
-    // print vals
-    // if (threadId == 0 && blockIdx.x == 0) {
-    //     printf("Thread %d vals: ", threadId);
-    //     for (int i = 0; i < VALS_PER_THREAD + 1; i++) {
-    //         printf("%d ", static_cast<int>(vals[i]));
-    //     }
-    //     printf("\n");
-    // }
-
     // if value is different from previous, mark as run start
     for (int i = 0; i < VALS_PER_THREAD; i++) {
         int idx = block_offset + threadId * VALS_PER_THREAD + i;
@@ -98,6 +89,7 @@ __global__ void label_runs(
             break;
         }
         run_start_flags[idx] = is_run_start ? 1 : 0;
+        // printf("run_start_flags[%d] = %d\n", idx, run_start_flags[idx]);
     }
 }
 
@@ -168,6 +160,63 @@ __global__ void upstream_scan(
     }
 }
 
+__global__ void upstream_reduction(
+    uint32_t raw_count,
+    uint32_t *run_start_flags, // pointer to GPU memory
+    uint32_t *blocksums) {
+
+    extern __shared__ __align__(16) uint32_t shmem_raw[]; // OK
+    uint32_t *shmem = reinterpret_cast<uint32_t *>(shmem_raw);
+
+    int threadId = threadIdx.x;
+    int threads_per_block = blockDim.x;
+    int block_offset = blockIdx.x * threads_per_block * VALS_PER_THREAD;
+
+    // load from global memory & perform thread reduction
+    uint32_t vals[VALS_PER_THREAD];
+    for (int i = 0; i < VALS_PER_THREAD; i++) {
+        int idx = block_offset + threadId * VALS_PER_THREAD + i;
+        if (idx >= raw_count) {
+            vals[i] = 0;
+        } else {
+            vals[i] = run_start_flags[idx];
+        }
+    }
+
+    uint32_t thread_total = 0;
+    for (int i = 0; i < VALS_PER_THREAD; i++) {
+        thread_total = thread_total + vals[i];
+    }
+
+    shmem[threadId] = thread_total;
+
+    // scan across shmem (across all warps in the block)
+    for (int i = 1; i < threads_per_block; i <<= 1) {
+        __syncthreads();
+        uint32_t cur_val = shmem[threadId];
+        if (threadId >= i) {
+            cur_val = shmem[threadId - i] + cur_val;
+        }
+        __syncthreads();
+        shmem[threadId] = cur_val;
+    }
+    __syncthreads();
+
+    // add prev warp reduction to each thread
+    uint32_t threadPrefix = 0;
+    if (threadId > 0) { // mask first warp
+        threadPrefix = shmem[threadId - 1];
+    }
+    for (int i = 0; i < VALS_PER_THREAD; i++) {
+        vals[i] = threadPrefix + vals[i];
+    }
+
+    // write blockSum to workspace array
+    if (threadId == threads_per_block - 1) {
+        blocksums[blockIdx.x] = shmem[threads_per_block - 1];
+    }
+}
+
 __global__ void spine_scan(
     // size_t vals_per_thread,
     uint32_t *blocksums // pointer to GPU memory
@@ -218,7 +267,71 @@ __global__ void spine_scan(
     }
 }
 
-__global__ void downstream_scan_fix(
+__global__ void downstream_scan(
+    uint32_t *run_start_flags,        // pointer to GPU memory
+    uint32_t *runs,
+    uint32_t *blocksums // pointer to GPU memory
+) {
+    extern __shared__ __align__(16) uint32_t shmem_raw[]; // OK
+    uint32_t *shmem = reinterpret_cast<uint32_t *>(shmem_raw);
+
+    int threads_per_block = blockDim.x;
+    int block_offset = blockIdx.x * threads_per_block * VALS_PER_THREAD;
+
+    int threadId = threadIdx.x;
+
+    // load from global memory & perform thread scan
+    uint32_t vals[VALS_PER_THREAD];
+    for (int i = 0; i < VALS_PER_THREAD; i++) {
+        int idx = block_offset + threadId * VALS_PER_THREAD + i;
+        vals[i] = run_start_flags[idx];
+    }
+    for (int i = 1; i < VALS_PER_THREAD; i++) {
+        vals[i] = vals[i - 1] + vals[i];
+    }
+
+    uint32_t thread_sum = vals[VALS_PER_THREAD - 1];
+    shmem[threadId] = thread_sum;
+
+    // scan across shmem (across all warps in the block)
+    for (int i = 1; i < threads_per_block; i <<= 1) {
+        __syncthreads();
+        uint32_t cur_val = shmem[threadId];
+        if (threadId >= i) {
+            cur_val = shmem[threadId - i] + cur_val;
+        }
+        __syncthreads();
+        shmem[threadId] = cur_val;
+    }
+    __syncthreads();
+
+    // fix up each thread in block
+    uint32_t threadPrefix = 0;
+    if (threadId > 0) { // mask first warp
+        threadPrefix = shmem[threadId - 1];
+    }
+    for (int i = 0; i < VALS_PER_THREAD; i++) {
+        vals[i] = threadPrefix + vals[i];
+    }
+
+    // add block prefix
+    uint32_t block_prefix = 0;
+    if (blockIdx.x > 0) {
+        block_prefix = blocksums[blockIdx.x - 1];
+    }
+    for (int i = 0; i < VALS_PER_THREAD; i++) {
+        int idx = block_offset + threadId * VALS_PER_THREAD + i;
+        vals[i] = block_prefix + vals[i];
+    }
+
+    // write back to x
+    for (int i = 0; i < VALS_PER_THREAD; i++) {
+        int idx = block_offset + threadId * VALS_PER_THREAD + i;
+        runs[idx] = vals[i];
+    }
+}
+
+__global__ void downstream_reduce_fix(
     uint32_t *x,        // pointer to GPU memory
     uint32_t *blocksums // pointer to GPU memory
 ) {
@@ -345,12 +458,28 @@ uint32_t launch_rle_compress(
     uint32_t shmem_size_bytes = WARPS_PER_BLOCK * 32 * sizeof(uint32_t);
 
     label_runs<<<gridDim, blockDim>>>(raw_count, raw, run_start_flags);
+    // printf("Labeled runs\n");
+    // for (uint32_t i = 0; i < MIN(raw_count, 16); i++) {
+    //     uint32_t flag;
+    //     CUDA_CHECK(cudaMemcpy(
+    //         &flag,
+    //         &run_start_flags[i],
+    //         sizeof(uint32_t),
+    //         cudaMemcpyDeviceToHost));
+    //     printf("run_start_flags[%u] = %u\n", i, flag);
+    // }
 
-    upstream_scan<<<gridDim, blockDim, shmem_size_bytes>>>(
+    // upstream_scan<<<gridDim, blockDim, shmem_size_bytes>>>(
+    //     raw_count,
+    //     run_start_flags,
+    //     runs,
+    //     block_sums);
+
+    upstream_reduction<<<gridDim, blockDim, shmem_size_bytes>>>(
         raw_count,
         run_start_flags,
-        runs,
         block_sums);
+
 
     // // scan "spine" (the block sums)
     dim3 spine_gridDim(1);
@@ -359,7 +488,8 @@ uint32_t launch_rle_compress(
     spine_scan<<<spine_gridDim, spine_blockDim, spine_shmem_size_bytes>>>(block_sums);
 
     // // downstream fixup
-    downstream_scan_fix<<<gridDim, blockDim>>>(runs, block_sums);
+    // downstream_reduce_fix<<<gridDim, blockDim>>>(runs, block_sums);
+    downstream_scan<<<gridDim, blockDim, shmem_size_bytes>>>(run_start_flags, runs, block_sums);
 
     collect_run_starts<<<gridDim, blockDim>>>(
         raw_count,
