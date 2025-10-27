@@ -258,10 +258,8 @@ __global__ void collect_run_starts(
 ) {
     // uint32_t base_idx = blockIdx.x * blockDim.x + threadIdx.x;
     int threads_per_block = blockDim.x;
-
     int block_offset = blockIdx.x * threads_per_block * VALS_PER_THREAD;
 
-#pragma unroll
     for (int j = 0; j < VALS_PER_THREAD; j++) {
         uint32_t i = block_offset + threadIdx.x * VALS_PER_THREAD + j;
         if (i >= raw_count)
@@ -345,13 +343,6 @@ uint32_t launch_rle_compress(
     dim3 gridDim = dim3(num_blocks, 1, 1);
     dim3 blockDim = dim3(MIN(raw_count, WARPS_PER_BLOCK * 32), 1, 1);
     uint32_t shmem_size_bytes = WARPS_PER_BLOCK * 32 * sizeof(uint32_t);
-
-    // printf("first few raw data: \n");
-    // for (int i = 0; i < MIN(10, raw_count); ++i) {
-    //     char c;
-    //     CUDA_CHECK(cudaMemcpy(&c, &raw[i], sizeof(char), cudaMemcpyDeviceToHost));
-    //     printf("%d ", static_cast<int>(c));
-    // }
 
     label_runs<<<gridDim, blockDim>>>(raw_count, raw, run_start_flags);
 

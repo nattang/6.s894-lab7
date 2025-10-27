@@ -125,6 +125,132 @@ __global__ void upstream_scan(
 }
 
 template <typename Op>
+__global__ void upstream_reduction(
+    size_t n,
+    typename Op::Data *x,        // pointer to GPU memory
+    typename Op::Data *blocksums // pointer to GPU memory
+) {
+    using Data = typename Op::Data;
+
+    extern __shared__ __align__(16) char shmem_raw[]; // OK
+    Data *shmem = reinterpret_cast<Data *>(shmem_raw);
+
+    int threadId = threadIdx.x;
+    int threads_per_block = blockDim.x;
+    int block_offset = blockIdx.x * threads_per_block * VALS_PER_THREAD;
+
+    // load from global memory & perform thread scan
+    Data vals[VALS_PER_THREAD];
+    for (int i = 0; i < VALS_PER_THREAD; i++) {
+        int idx = block_offset + threadId * VALS_PER_THREAD + i;
+        if (idx >= n) {
+            vals[i] = Op::identity();
+        } else {
+            vals[i] = x[idx];
+        }
+    }
+
+    Data thread_total = Op::identity();
+    for (int i = 0; i < VALS_PER_THREAD; i++) {
+        thread_total = Op::combine(thread_total, vals[i]);
+    }
+
+    shmem[threadId] = thread_total;
+
+    // scan across shmem (across all warps in the block)
+    for (int i = 1; i < threads_per_block; i <<= 1) {
+        __syncthreads();
+        Data cur_val = shmem[threadId];
+        if (threadId >= i) {
+            cur_val = Op::combine(shmem[threadId - i], cur_val);
+        }
+        __syncthreads();
+        shmem[threadId] = cur_val;
+    }
+    __syncthreads();
+
+    // add prev warp reduction to each thread
+    Data threadPrefix = Op::identity();
+    if (threadId > 0) { // mask first warp
+        threadPrefix = shmem[threadId - 1];
+    }
+    for (int i = 0; i < VALS_PER_THREAD; i++) {
+        vals[i] = Op::combine(threadPrefix, vals[i]);
+    }
+
+    // write blockSum to workspace array
+    if (threadId == threads_per_block - 1) {
+        blocksums[blockIdx.x] = shmem[threads_per_block - 1];
+    }
+}
+
+template <typename Op>
+__global__ void downstream_scan(
+    size_t n,
+    typename Op::Data *x,        // pointer to GPU memory
+    typename Op::Data *blocksums // pointer to GPU memory
+) {
+    using Data = typename Op::Data;
+    extern __shared__ __align__(16) char shmem_raw[]; // OK
+    Data *shmem = reinterpret_cast<Data *>(shmem_raw);
+
+    int threads_per_block = blockDim.x;
+    int block_offset = blockIdx.x * threads_per_block * VALS_PER_THREAD;
+
+    int threadId = threadIdx.x;
+
+    // load from global memory & perform thread scan
+    Data vals[VALS_PER_THREAD];
+    for (int i = 0; i < VALS_PER_THREAD; i++) {
+        int idx = block_offset + threadId * VALS_PER_THREAD + i;
+        vals[i] = x[idx];
+    }
+    for (int i = 1; i < VALS_PER_THREAD; i++) {
+        vals[i] = Op::combine(vals[i - 1], vals[i]);
+    }
+
+    Data thread_sum = vals[VALS_PER_THREAD - 1];
+    shmem[threadId] = thread_sum;
+
+    // scan across shmem (across all warps in the block)
+    for (int i = 1; i < threads_per_block; i <<= 1) {
+        __syncthreads();
+        Data cur_val = shmem[threadId];
+        if (threadId >= i) {
+            cur_val = Op::combine(shmem[threadId - i], cur_val);
+        }
+        __syncthreads();
+        shmem[threadId] = cur_val;
+    }
+    __syncthreads();
+
+    // fix up each thread in block
+    Data threadPrefix = Op::identity();
+    if (threadId > 0) { // mask first warp
+        threadPrefix = shmem[threadId - 1];
+    }
+    for (int i = 0; i < VALS_PER_THREAD; i++) {
+        vals[i] = Op::combine(threadPrefix, vals[i]);
+    }
+
+    // add block prefix
+    Data block_prefix = Op::identity();
+    if (blockIdx.x > 0) {
+        block_prefix = blocksums[blockIdx.x - 1];
+    }
+    for (int i = 0; i < VALS_PER_THREAD; i++) {
+        int idx = block_offset + threadId * VALS_PER_THREAD + i;
+        vals[i] = Op::combine(block_prefix, vals[i]);
+    }
+
+    // write back to x
+    for (int i = 0; i < VALS_PER_THREAD; i++) {
+        int idx = block_offset + threadId * VALS_PER_THREAD + i;
+        x[idx] = vals[i];
+    }
+}
+
+template <typename Op>
 __global__ void spine_scan(
     // size_t vals_per_thread,
     typename Op::Data *blocksums // pointer to GPU memory
@@ -178,7 +304,7 @@ __global__ void spine_scan(
 }
 
 template <typename Op>
-__global__ void downstream_scan_fix(
+__global__ void downstream_reduce_fix(
     typename Op::Data *x,        // pointer to GPU memory
     typename Op::Data *blocksums // pointer to GPU memory
 ) {
@@ -274,11 +400,7 @@ typename Op::Data *launch_scan(
     uint32_t shmem_size_bytes = WARPS_PER_BLOCK * 32 * sizeof(Data);
 
     // printf("lauchining upstream \n");
-    upstream_scan<Op><<<gridDim, blockDim, shmem_size_bytes>>>(n, x, block_sums);
-
-    if (num_blocks == 1) {
-        return x;
-    }
+    upstream_reduction<Op><<<gridDim, blockDim, shmem_size_bytes>>>(n, x, block_sums);
 
     // scan "spine" (the block sums)
     dim3 spine_gridDim(1);
@@ -287,7 +409,7 @@ typename Op::Data *launch_scan(
     spine_scan<Op><<<spine_gridDim, spine_blockDim, spine_shmem_size_bytes>>>(block_sums);
 
     // downstream fixup
-    downstream_scan_fix<Op><<<gridDim, blockDim>>>(x, block_sums);
+    downstream_scan<Op><<<gridDim, blockDim, shmem_size_bytes>>>(n, x, block_sums);
 
     return x;
 }
